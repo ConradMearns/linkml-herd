@@ -348,3 +348,171 @@ def test_layout_is_read_from_pages_written_before_the_rename(tmp_path):
 def test_cli_reports_missing_file(tmp_path, capsys):
     assert main([str(tmp_path / "missing.yaml")]) == 1
     assert "linkml-herd:" in capsys.readouterr().err
+
+
+# --- crossing minimisation ---------------------------------------------------------
+
+
+def edge_crossings(schema, layout) -> int:
+    """Crossings between edge pieces spanning the same gap between columns."""
+    from itertools import combinations
+
+    from linkml_herd.render import _slot_index, row_y
+
+    classes = {c.name: c for c in schema.classes}
+    pieces: dict[float, list[tuple[float, float]]] = {}
+    for fk in schema.foreign_keys:
+        src, dst = layout.boxes[fk.from_class], layout.boxes[fk.to_class]
+        if fk.inverse or src.x == dst.x:
+            continue
+        sy = row_y(src, _slot_index(classes[fk.from_class], fk.from_slot))
+        ty = row_y(dst, _slot_index(classes[fk.to_class], fk.to_slot))
+        forward = dst.x > src.x
+        anchors = [
+            (src.right if forward else src.x, sy),
+            *layout.waypoints.get(fk.id, []),
+            (dst.x if forward else dst.right, ty),
+        ]
+        for (ax, ay), (bx, by) in zip(anchors[::2], anchors[1::2]):
+            pieces.setdefault(min(ax, bx), []).append((ay, by) if ax < bx else (by, ay))
+    return sum(
+        (a1 - a2) * (b1 - b2) < 0 for ps in pieces.values() for (a1, b1), (a2, b2) in combinations(ps, 2)
+    )
+
+
+# Declared in an order that, stacked as written, crosses every edge.
+CROSSED = """
+name: crossed
+classes:
+  A1:
+    attributes:
+      to_b3: { range: B3 }
+  A2:
+    attributes:
+      to_b2: { range: B2 }
+  A3:
+    attributes:
+      to_b1: { range: B1 }
+  B1:
+    attributes:
+      id: { identifier: true }
+  B2:
+    attributes:
+      id: { identifier: true }
+  B3:
+    attributes:
+      id: { identifier: true }
+"""
+
+
+def test_columns_are_ordered_to_untangle_edges():
+    schema = parse_linkml(CROSSED)
+    assert edge_crossings(schema, auto_layout(schema)) == 0
+
+
+def test_rows_an_edge_attaches_to_count_towards_crossings():
+    # Both of Hub's references could leave from either order of Left/Right; only one doesn't cross.
+    schema = parse_linkml(
+        "name: x\nclasses:\n"
+        "  Hub:\n    attributes:\n      first: { range: Low }\n      second: { range: High }\n"
+        "  High:\n    attributes:\n      id: { identifier: true }\n"
+        "  Low:\n    attributes:\n      id: { identifier: true }\n"
+    )
+    layout = auto_layout(schema)
+    assert edge_crossings(schema, layout) == 0
+    assert layout.boxes["Low"].y < layout.boxes["High"].y
+
+
+def test_layout_is_deterministic():
+    schema = parse_linkml_file(EXAMPLE)
+    assert auto_layout(schema) == auto_layout(parse_linkml_file(EXAMPLE))
+
+
+def test_tables_line_up_with_what_they_reference():
+    # A lone chain should draw as straight lines: each reference leaves level with the id it points at.
+    schema = parse_linkml(
+        "name: x\nclasses:\n"
+        "  A:\n    attributes:\n      x: {}\n      y: {}\n      b: { range: B }\n"
+        "  B:\n    attributes:\n      id: { identifier: true }\n"
+    )
+    from linkml_herd.render import _edge_geometry
+
+    d, _ = _edge_geometry(schema.foreign_keys[0], {c.name: c for c in schema.classes}, auto_layout(schema))
+    ys = {float(v) for v in re.findall(r",(-?[\d.]+)", d)}
+    assert len(ys) == 1, d
+
+
+# --- inverse relationships -----------------------------------------------------------
+
+WITH_INVERSE = EXAMPLE.read_text().replace(
+    "      full_name:\n",
+    "      orders:\n        range: Order\n        multivalued: true\n      full_name:\n",
+)
+
+
+def test_inverse_edges_do_not_shape_the_layout():
+    schema = parse_linkml(WITH_INVERSE)
+    boxes = auto_layout(schema).boxes
+    assert boxes["Order"].x < boxes["Customer"].x  # Customer.orders doesn't pull Customer leftwards
+    assert auto_layout(parse_linkml_file(EXAMPLE)).boxes.keys() == boxes.keys()
+
+
+def test_inverse_edges_run_back_along_their_counterparts_lanes():
+    schema = parse_linkml(WITH_INVERSE)
+    layout = auto_layout(schema)
+    forward = layout.waypoints["Order.customer->Customer"]
+    back = layout.waypoints["Customer.orders->Order"]
+    assert [x for x, _ in back] == [x for x, _ in reversed(forward)]
+
+
+def test_inverse_edges_are_drawn_but_hidden_by_default():
+    html = render_html(parse_linkml(WITH_INVERSE))
+    assert '<g class="edge inverse" data-id="Customer.orders-&gt;Order"' in html
+    assert 'data-inverse-of="Order.customer-&gt;Customer"' in html
+    assert '<html lang="en" data-theme="monokai">' in html
+    assert '<input type="checkbox" id="inverse"> inverses (1)' in html
+    assert "<strong>7</strong> relations" in html  # the inverse restates one, so it adds none
+    assert embedded_data(html)["showInverse"] is False
+
+
+def test_inverse_edges_can_be_shown():
+    html = render_html(parse_linkml(WITH_INVERSE), show_inverse=True)
+    assert 'class="show-inverse"' in html
+    assert 'id="inverse" checked>' in html
+    assert embedded_data(html)["showInverse"] is True
+
+
+def test_no_inverse_toggle_without_inverses():
+    assert 'id="inverse"' not in render_html(parse_linkml_file(EXAMPLE))
+
+
+def test_svg_leaves_out_inverse_edges_unless_asked():
+    schema = parse_linkml(WITH_INVERSE)
+
+    def edge_ids(svg: str) -> set[str]:
+        return {
+            g.get("data-id") for g in ET.fromstring(svg.split("\n", 1)[1]).iter(f"{SVG}g") if g.get("data-id")
+        }
+
+    assert "Customer.orders->Order" not in edge_ids(render_svg(schema))
+    assert "Customer.orders->Order" in edge_ids(render_svg(schema, show_inverse=True))
+
+
+def test_cli_inverse_setting_sticks_until_changed(tmp_path):
+    schema = tmp_path / "s.yaml"
+    schema.write_text(WITH_INVERSE)
+    page = tmp_path / "s.html"
+    main([str(schema), "--inverse"])
+    assert embedded_data(page.read_text())["showInverse"] is True
+    main([str(schema)])
+    assert embedded_data(page.read_text())["showInverse"] is True
+    main([str(schema), "--no-inverse"])
+    assert embedded_data(page.read_text())["showInverse"] is False
+
+
+# --- page chrome -----------------------------------------------------------------------
+
+
+def test_brand_links_to_the_repository():
+    html = render_html(parse_linkml_file(EXAMPLE))
+    assert '<a class="brand" href="https://github.com/ConradMearns/linkml-herd"' in html

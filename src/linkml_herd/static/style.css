@@ -13,7 +13,8 @@ code { font-family: ui-monospace, SFMono-Regular, monospace; }
   background: var(--bar-bg); color: var(--bar-text); font-size: 12px; position: relative; z-index: 2;
   border-bottom: 1px solid var(--bar-edge);
 }
-.brand { font-size: 15px; font-weight: 700; letter-spacing: 0.03em; color: var(--bar-strong); }
+.brand { font-size: 15px; font-weight: 700; letter-spacing: 0.03em; color: var(--bar-strong); text-decoration: none; }
+.brand:hover { text-decoration: underline; text-underline-offset: 3px; }
 .bar h1 {
   margin: 0; font-size: 13px; font-weight: 600; color: var(--bar-strong);
   padding-left: 16px; border-left: 1px solid var(--bar-border);
@@ -45,6 +46,8 @@ code { font-family: ui-monospace, SFMono-Regular, monospace; }
   background: var(--primary-bg); color: var(--primary-text); border-color: var(--primary-bg); font-weight: 600;
 }
 .actions button.primary:hover { background: var(--primary-hover); border-color: var(--primary-hover); }
+.toggle { display: flex; align-items: center; gap: 5px; cursor: pointer; color: var(--bar-text); }
+.toggle input { margin: 0; cursor: pointer; accent-color: var(--primary-bg); }
 .actions select {
   font: inherit; padding: 4px 6px; border-radius: 6px; cursor: pointer;
   border: 1px solid var(--bar-border); background: var(--bar-btn); color: var(--bar-text);
@@ -66,6 +69,10 @@ code { font-family: ui-monospace, SFMono-Regular, monospace; }
 .edges { position: absolute; left: 0; top: 0; overflow: visible; }
 .edge path { fill: none; stroke: var(--edge); stroke-width: 1; }
 .edge:hover path { stroke: var(--edge-hover); stroke-width: 1.5; }
+/* Inverse relationships restate another edge from its other end: hidden unless toggled on. */
+.edge.inverse { display: none; }
+.show-inverse .edge.inverse { display: inline; }
+.edge.inverse path { stroke-dasharray: 4 3; }
 #arrow polyline { fill: var(--edge); stroke: var(--edge); stroke-width: 1; stroke-linejoin: round; }
 .edge text {
   font-size: 10px; fill: var(--edge-label); text-anchor: middle; dominant-baseline: central;
