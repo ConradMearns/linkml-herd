@@ -14,12 +14,13 @@ from __future__ import annotations
 
 import json
 import math
+import random
 import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from html import escape
 from importlib.resources import files
-from itertools import pairwise
+from itertools import combinations, pairwise
 from pathlib import Path
 from typing import Any
 
@@ -33,6 +34,7 @@ COL_GAP = 140  # horizontal room between layers for edges + labels
 ROW_GAP = 40
 PAD = 48
 LOOP = 36  # how far a same-side edge bulges out
+INVERSE_SHIFT = 6  # how far below its counterpart's lane an inverse edge runs
 
 Point = tuple[float, float]
 
@@ -65,10 +67,10 @@ def table_height(c: Class) -> float:
     return 2 * BORDER + HEADER_H + max(1, len(c.slots)) * ROW_H
 
 
-def _depths(schema: Schema) -> dict[str, int]:
+def _depths(names: list[str], fks: list[ForeignKey]) -> dict[str, int]:
     """A table's depth is 1 + the deepest table it references (ignoring cycles)."""
-    targets: dict[str, set[str]] = {c.name: set() for c in schema.classes}
-    for fk in schema.foreign_keys:
+    targets: dict[str, set[str]] = {name: set() for name in names}
+    for fk in fks:
         if fk.to_class != fk.from_class:
             targets[fk.from_class].add(fk.to_class)
 
@@ -80,72 +82,201 @@ def _depths(schema: Schema) -> dict[str, int]:
             depth[name] = 1 + max(deeper) if deeper else 0
         return depth[name]
 
-    for c in schema.classes:
-        visit(c.name, frozenset())
+    for name in names:
+        visit(name, frozenset())
     return depth
 
 
+def _isotonic(values: list[float]) -> list[float]:
+    """The closest (least-squares) non-decreasing sequence: pool adjacent violators."""
+    blocks: list[list[float]] = []  # [sum, count]
+    for v in values:
+        blocks.append([v, 1])
+        while len(blocks) > 1 and blocks[-2][0] / blocks[-2][1] > blocks[-1][0] / blocks[-1][1]:
+            s, n = blocks.pop()
+            blocks[-1][0] += s
+            blocks[-1][1] += n
+    return [s / n for s, n in blocks for _ in range(int(n))]
+
+
+# Items in a layout column: ("t", class name, col) for tables, ("l", fk id, col) for lanes.
+_Item = tuple[str, str, int]
+SWEEPS = 24  # most barycenter + sift rounds per ordering tried
+RESTARTS = 8  # orderings tried (see the loop below); shuffles are seeded, so output is stable
+PLACE_PASSES = 8  # rounds of sliding tables towards their neighbours
+
+
 def auto_layout(schema: Schema) -> Layout:
-    """Place tables in columns by foreign-key depth (a simple Sugiyama layout).
+    """Place tables in columns by foreign-key depth (a Sugiyama-style layout).
 
     Referencing tables sit to the left of what they point at, so edges flow
-    left-to-right. Edges that skip columns reserve a lane in every column they
-    cross, and a few barycenter sweeps order each column to reduce crossings.
+    left-to-right, and edges that skip columns reserve a lane in every column
+    they cross. Each column is ordered to minimise crossings -- barycenter
+    sweeps, then each item moved to its best spot in its column (sifting),
+    keeping the best order seen and counting where each edge really attaches
+    (its row, not just its table) -- and then tables slide up or down towards
+    the rows they connect to, so edges run as straight as that order allows.
+    Inverse edges (see `parse._mark_inverses`) don't shape the layout; they
+    follow the lanes of the edge they restate.
     """
-    depth = _depths(schema)
+    classes = {c.name: c for c in schema.classes}
+    fks = [fk for fk in schema.foreign_keys if not fk.inverse]
+    depth = _depths(list(classes), fks)
     max_depth = max(depth.values(), default=0)
     col_of = {name: max_depth - d for name, d in depth.items()}
 
-    # Items are ("t", class name) for tables and ("l", fk id) for lanes.
-    Item = tuple[str, str]
-    columns: list[list[Item]] = [[] for _ in range(max_depth + 1)]
+    columns: list[list[_Item]] = [[] for _ in range(max_depth + 1)]
     for c in schema.classes:
-        columns[col_of[c.name]].append(("t", c.name))
+        columns[col_of[c.name]].append(("t", c.name, col_of[c.name]))
+    height = {item: table_height(classes[item[1]]) for col in columns for item in col}
 
-    neighbours: dict[Item, set[Item]] = {}
-    for fk in schema.foreign_keys:
+    def port(name: str, slot: str | None) -> float:
+        """Where an edge meets a table, as a fraction of the table's height."""
+        c = classes[name]
+        return (row_y(Box(0, 0, 0), _slot_index(c, slot))) / table_height(c)
+
+    # Each edge piece between neighbouring columns: (left item, its port, right item, its port).
+    segments: list[list[tuple[_Item, float, _Item, float]]] = [[] for _ in range(max_depth)]
+    # Per item, its pieces: (side -1 left / +1 right, other item, other's port, own port).
+    adj: dict[_Item, list[tuple[int, _Item, float, float]]] = {}
+    for fk in fks:
         a, b = col_of[fk.from_class], col_of[fk.to_class]
+        if a == b:
+            continue
         step = 1 if b > a else -1
-        chain: list[Item] = [("t", fk.from_class)]
+        chain = [(("t", fk.from_class, a), port(fk.from_class, fk.from_slot))]
         for col in range(a + step, b, step):
-            columns[col].append(("l", fk.id))
-            chain.append(("l", fk.id))
-        chain.append(("t", fk.to_class))
-        for u, v in pairwise(chain):
-            if u != v:
-                neighbours.setdefault(u, set()).add(v)
-                neighbours.setdefault(v, set()).add(u)
+            lane: _Item = ("l", fk.id, col)
+            columns[col].append(lane)
+            height[lane] = ROW_H
+            chain.append((lane, 0.5))
+        chain.append((("t", fk.to_class, b), port(fk.to_class, fk.to_slot)))
+        for (u, pu), (v, pv) in pairwise(chain):
+            if u[2] > v[2]:
+                (u, pu), (v, pv) = (v, pv), (u, pu)
+            segments[u[2]].append((u, pu, v, pv))
+            adj.setdefault(u, []).append((1, v, pv, pu))
+            adj.setdefault(v, []).append((-1, u, pu, pv))
 
-    def sweep(order: range, ref_offset: int) -> None:
+    # --- order each column to minimise crossings ---------------------------------
+    pos: dict[_Item, int] = {}
+
+    def reindex(col: int) -> None:
+        pos.update((item, i) for i, item in enumerate(columns[col]))
+
+    def crossings() -> int:
+        total = 0
+        for seg in segments:
+            ends = [(pos[u] + pu, pos[v] + pv) for u, pu, v, pv in seg]
+            total += sum((a1 - a2) * (b1 - b2) < 0 for (a1, b1), (a2, b2) in combinations(ends, 2))
+        return total
+
+    def sweep(order: range, side: int, rows: bool) -> None:
+        """Sort columns by the mean position of their neighbours on one side (barycenter).
+
+        With `rows`, positions include which row each edge attaches to; without, only
+        which item -- coarser, but it sometimes settles in a better optimum.
+        """
         for col in order:
-            ref = {item: i for i, item in enumerate(columns[col + ref_offset])}
 
-            def key(pair: tuple[int, Item], ref: dict[Item, int] = ref) -> float:
-                idx, item = pair
-                hits = [ref[n] for n in neighbours.get(item, ()) if n in ref]
-                return sum(hits) / len(hits) if hits else idx
+            def key(item: _Item) -> float:
+                hits = [pos[o] + (po - own) * rows for s, o, po, own in adj.get(item, ()) if s == side]
+                return sum(hits) / len(hits) if hits else pos[item]
 
-            columns[col] = [item for _, item in sorted(enumerate(columns[col]), key=key)]
+            columns[col].sort(key=key)
+            reindex(col)
 
-    for _ in range(2):
-        sweep(range(1, len(columns)), -1)
-        sweep(range(len(columns) - 2, -1, -1), +1)
+    def swap_gain(upper: _Item, lower: _Item) -> int:
+        """How many fewer crossings there would be with `lower` moved above `upper`."""
+        gain = 0
+        for s, o, po, _ in adj.get(upper, ()):
+            for t, q, pq, _ in adj.get(lower, ()):
+                if s == t:
+                    a, b = pos[o] + po, pos[q] + pq
+                    gain += (a > b) - (a < b)
+        return gain
 
-    heights = {c.name: table_height(c) for c in schema.classes}
+    def sift() -> None:
+        """Move each item to the spot in its column where it crosses the fewest edges."""
+        for col in range(len(columns)):
+            for item in list(columns[col]):
+                others = [o for o in columns[col] if o != item]
+                # Crossings saved by having `item` below each other item rather than above it.
+                saved = [swap_gain(item, o) for o in others]
+                best_at, best_cost, cost = 0, 0, 0
+                for j, g in enumerate(saved, 1):
+                    cost -= g
+                    if cost < best_cost or (cost == best_cost and j == pos[item]):
+                        best_at, best_cost = j, cost
+                columns[col] = [*others[:best_at], item, *others[best_at:]]
+                reindex(col)
+
+    initial = [list(c) for c in columns]
+    best: list[list[_Item]] = []
+    fewest = -1
+    for start in range(RESTARTS):
+        # Sweeps settle in a local optimum, so try from the schema's order with and
+        # without row positions, then from shuffles of the best order so far.
+        columns = [list(c) for c in (initial if start < 2 else best)]
+        if start >= 2:
+            for items in columns:
+                random.Random(start).shuffle(items)
+        for col in range(len(columns)):
+            reindex(col)
+        n, stale = crossings(), 0
+        if fewest < 0 or n < fewest:
+            best, fewest = [list(c) for c in columns], n
+        for _ in range(SWEEPS):
+            if not fewest or stale >= 4:
+                break
+            sweep(range(1, len(columns)), -1, rows=start % 2 == 0)
+            sweep(range(len(columns) - 2, -1, -1), +1, rows=start % 2 == 0)
+            sift()
+            n = crossings()
+            stale = 0 if n < fewest else stale + 1
+            if n < fewest:
+                best, fewest = [list(c) for c in columns], n
+        if not fewest:
+            break
+    columns = best
+
+    # --- vertical placement: line edges up, keeping column order and gaps ---------
+    def gap_after(item: _Item) -> float:
+        return ROW_GAP if item[0] == "t" else ROW_GAP / 2
+
+    top: dict[_Item, float] = {}
+    for items in columns:
+        y: float = 0
+        for item in items:
+            top[item] = y
+            y += height[item] + gap_after(item)
+
+    for p in range(PLACE_PASSES):
+        for col in range(len(columns)) if p % 2 == 0 else range(len(columns) - 1, -1, -1):
+            items = columns[col]
+            want = []
+            for item in items:
+                pulls = [top[o] + po * height[o] - own * height[item] for _, o, po, own in adj.get(item, ())]
+                want.append(sum(pulls) / len(pulls) if pulls else top[item])
+            offsets = [0.0]
+            for item in items[:-1]:
+                offsets.append(offsets[-1] + height[item] + gap_after(item))
+            slid = _isotonic([w - off for w, off in zip(want, offsets)])
+            top.update((item, z + off) for item, z, off in zip(items, slid, offsets))
+
+    shift = PAD - min(top.values(), default=PAD)
     boxes: dict[str, Box] = {}
     lane_y: dict[tuple[str, int], float] = {}
-    for col, items in enumerate(columns):
-        y: float = PAD
-        for kind, ref in items:
-            if kind == "t":
-                boxes[ref] = Box(x=column_x(col), y=y, h=heights[ref])
-                y += heights[ref] + ROW_GAP
-            else:
-                lane_y[(ref, col)] = y + ROW_H / 2
-                y += ROW_H + ROW_GAP / 2
+    for item, y in top.items():
+        kind, ref, col = item
+        y = round(y + shift)
+        if kind == "t":
+            boxes[ref] = Box(x=column_x(col), y=y, h=height[item])
+        else:
+            lane_y[(ref, col)] = y + ROW_H / 2
 
     waypoints: dict[str, list[Point]] = {}
-    for fk in schema.foreign_keys:
+    for fk in fks:
         a, b = col_of[fk.from_class], col_of[fk.to_class]
         forward = b > a
         points: list[Point] = []
@@ -154,6 +285,10 @@ def auto_layout(schema: Schema) -> Layout:
             points += [(left, y), (left + TABLE_W, y)] if forward else [(left + TABLE_W, y), (left, y)]
         if points:
             waypoints[fk.id] = points
+    # An inverse edge runs back along the lanes of the edge it restates, just below it.
+    for fk in schema.foreign_keys:
+        if fk.inverse_of in waypoints:
+            waypoints[fk.id] = [(x, y + INVERSE_SHIFT) for x, y in reversed(waypoints[fk.inverse_of])]
     return Layout(boxes=boxes, waypoints=waypoints)
 
 
@@ -218,6 +353,11 @@ def read_saved_layout(html_path: Path) -> dict[str, Any]:
     """Pull the canvas layout out of a page previously written by linkml-herd (or saved from it)."""
     layout = read_saved_data(html_path).get("layout")
     return layout if isinstance(layout, dict) else {}
+
+
+def read_saved_inverse(html_path: Path) -> bool:
+    """Whether the page was saved with inverse relationships shown."""
+    return read_saved_data(html_path).get("showInverse") is True
 
 
 def read_saved_theme(html_path: Path) -> str | None:
@@ -298,8 +438,13 @@ def _edge_svg(fk: ForeignKey, classes: dict[str, Class], layout: Layout) -> str:
     if waypoints:
         attrs["data-waypoints"] = json.dumps([[x, y] for x, y in waypoints])
     title = f"{fk.from_class}.{fk.from_slot} → {fk.to_class}" + (f".{fk.to_slot}" if fk.to_slot else "")
+    if fk.inverse_of:
+        attrs["data-inverse-of"] = fk.inverse_of
+        title += f" (inverse of {fk.inverse_of.split('->')[0]})"
     return (
-        '<g class="edge"' + "".join(f' {k}="{escape(v)}"' for k, v in attrs.items()) + ">"
+        f'<g class="edge{" inverse" if fk.inverse else ""}"'
+        + "".join(f' {k}="{escape(v)}"' for k, v in attrs.items())
+        + ">"
         f"<title>{escape(title)}</title>"
         f'<path d="{d}" marker-end="url(#arrow)"/>'
         f'<text x="{num(lx)}" y="{num(ly)}">{escape(fk.cardinality)}</text></g>'
@@ -359,6 +504,7 @@ def _asset(name: str) -> str:
 # "auto" follows the OS light/dark setting; the rest are the blocks in themes.css.
 THEMES = ("auto", *re.findall(r':root\[data-theme="([\w-]+)"\]', _asset("themes.css")))
 DEFAULT_THEME = "monokai"
+REPO_URL = "https://github.com/ConradMearns/linkml-herd"
 
 
 def _theme_menu(theme: str) -> str:
@@ -485,8 +631,10 @@ def _table_image(c: Class, box: Box, color: Color, clip_id: str) -> str:
 
 def _edge_image(fk: ForeignKey, classes: dict[str, Class], layout: Layout, color: Color) -> str:
     d, (lx, ly) = _edge_geometry(fk, classes, layout)
+    inverse = ' data-inverse=""' if fk.inverse else ""
+    dashes = ' stroke-dasharray="4 3"' if fk.inverse else ""
     return (
-        f'<g data-id="{escape(fk.id)}"><path d="{d}" fill="none" stroke="{color("edge")}"'
+        f'<g data-id="{escape(fk.id)}"{inverse}><path d="{d}" fill="none" stroke="{color("edge")}"{dashes}'
         ' marker-end="url(#herd-arrow)"/>'
         + _svg_text(
             lx,
@@ -504,11 +652,15 @@ def _edge_image(fk: ForeignKey, classes: dict[str, Class], layout: Layout, color
     )
 
 
-def _svg_image(schema: Schema, layout: Layout, color: Color) -> str:
+def _svg_image(schema: Schema, layout: Layout, color: Color, show_inverse: bool = True) -> str:
     classes = {c.name: c for c in schema.classes}
     x0, y0, x1, y1 = _bounds(layout)
     x, y, w, h = (num(v) for v in (x0 - PAD, y0 - PAD, x1 - x0 + 2 * PAD, y1 - y0 + 2 * PAD))
-    edges = "".join(_edge_image(fk, classes, layout, color) for fk in schema.foreign_keys)
+    edges = "".join(
+        _edge_image(fk, classes, layout, color)
+        for fk in schema.foreign_keys
+        if show_inverse or not fk.inverse
+    )
     tables = "".join(
         _table_image(c, layout.boxes[c.name], color, f"herd-clip-{i}") for i, c in enumerate(schema.classes)
     )
@@ -525,13 +677,21 @@ def _svg_image(schema: Schema, layout: Layout, color: Color) -> str:
 
 
 def render_svg(
-    schema: Schema, *, saved_layout: dict[str, Any] | None = None, theme: str = DEFAULT_THEME
+    schema: Schema,
+    *,
+    saved_layout: dict[str, Any] | None = None,
+    theme: str = DEFAULT_THEME,
+    show_inverse: bool = False,
 ) -> str:
-    """Render the diagram as a standalone SVG image in `theme`'s colours ("auto" draws as light)."""
+    """Render the diagram as a standalone SVG image in `theme`'s colours ("auto" draws as light).
+
+    Inverse relationships (see `parse._mark_inverses`) are left out unless `show_inverse`.
+    """
     if theme not in THEMES:
         raise ValueError(f"unknown theme {theme!r} (choose from {', '.join(THEMES)})")
     layout = apply_saved_layout(schema, auto_layout(schema), saved_layout or {})
-    return '<?xml version="1.0" encoding="UTF-8"?>\n' + _svg_image(schema, layout, theme_colors(theme)) + "\n"
+    image = _svg_image(schema, layout, theme_colors(theme), show_inverse)
+    return '<?xml version="1.0" encoding="UTF-8"?>\n' + image + "\n"
 
 
 def render_html(
@@ -541,12 +701,15 @@ def render_html(
     source: str | None = None,
     output_name: str | None = None,
     theme: str = DEFAULT_THEME,
+    show_inverse: bool = False,
 ) -> str:
     """Render the schema as a complete, self-contained HTML document.
 
     `saved_layout` is the canvas layout read back from a previous render (see
     `read_saved_layout`); tables it mentions keep their position. `theme` is
-    one of THEMES; viewers can still switch theme in the page.
+    one of THEMES; viewers can still switch theme in the page. Inverse
+    relationships are drawn but hidden unless `show_inverse`; the page has a
+    toggle for them.
     """
     if theme not in THEMES:
         raise ValueError(f"unknown theme {theme!r} (choose from {', '.join(THEMES)})")
@@ -567,6 +730,7 @@ def render_html(
     data = {
         "file": output_name,
         "theme": theme,
+        "showInverse": show_inverse,
         "geometry": {
             "tableW": TABLE_W,
             "headerH": HEADER_H,
@@ -594,9 +758,20 @@ def render_html(
         target = f" → {escape(output_name)}" if output_name else ""
         file_label = f'<span class="file" title="{escape(source)}{target}">{escape(source)}{target}</span>'
     description = f' title="{escape(schema.description)}"' if schema.description else ""
+    inverses = sum(fk.inverse for fk in schema.foreign_keys)
+    inverse_toggle = (
+        f'<label class="toggle" title="Also draw relationships that restate another from its other end,'
+        f' like a list of children beside each child\'s reference back"><input type="checkbox" id="inverse"'
+        f"{' checked' if show_inverse else ''}> inverses ({inverses})</label>"
+        if inverses
+        else ""
+    )
+    root_attrs = ("" if theme == "auto" else f' data-theme="{theme}"') + (
+        ' class="show-inverse"' if show_inverse else ""
+    )
 
     return f"""<!doctype html>
-<html lang="en"{"" if theme == "auto" else f' data-theme="{theme}"'}>
+<html lang="en"{root_attrs}>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -609,14 +784,15 @@ def render_html(
 </head>
 <body>
 <header class="bar">
-<span class="brand">linkml-herd</span>
+<a class="brand" href="{REPO_URL}" target="_blank" rel="noopener" title="linkml-herd on GitHub">linkml-herd</a>
 <h1{description}>{heading}</h1>
 {file_label}
 <span class="stat"><strong>{len(schema.classes)}</strong> classes</span>
-<span class="stat"><strong>{len(schema.foreign_keys)}</strong> relations</span>
+<span class="stat"><strong>{len(schema.foreign_keys) - inverses}</strong> relations</span>
 {_issues_html(schema)}
 <span class="save-state" id="save-state"></span>
 <span class="actions" id="actions" hidden>
+{inverse_toggle}
 {_theme_menu(theme)}
 <button id="export" title="Download the diagram as an SVG image">Export SVG</button>
 <button id="reset" title="Discard manual positions and use the automatic layout">Reset layout</button>

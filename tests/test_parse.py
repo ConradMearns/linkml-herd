@@ -159,3 +159,80 @@ class TestImports:
 
     def test_ignores_imports_without_resolver(self):
         assert parse_linkml(MAIN).foreign_keys == []
+
+
+# --- inverse relationships -----------------------------------------------------------
+
+
+def inverses(yaml_text: str) -> dict[str, str | None]:
+    return {fk.id: fk.inverse_of for fk in parse_linkml(yaml_text).foreign_keys}
+
+
+def test_list_of_children_is_the_inverse_of_each_childs_reference_back():
+    found = inverses(
+        SCHEMA.replace(
+            "      email:\n",
+            "      orders:\n        range: Order\n        multivalued: true\n      email:\n",
+        )
+    )
+    assert found == {"Customer.orders->Order": "Order.customer->Customer", "Order.customer->Customer": None}
+
+
+def test_declared_inverse_pairs_two_plain_references():
+    found = inverses(
+        """
+classes:
+  Person:
+    attributes:
+      passport: { range: Passport, inverse: holder }
+  Passport:
+    attributes:
+      holder: { range: Person }
+"""
+    )
+    assert found == {"Person.passport->Passport": "Passport.holder->Person", "Passport.holder->Person": None}
+
+
+def test_two_plain_references_are_separate_relationships():
+    found = inverses(
+        """
+classes:
+  Person:
+    attributes:
+      employer: { range: Company }
+  Company:
+    attributes:
+      ceo: { range: Person }
+"""
+    )
+    assert set(found.values()) == {None}
+
+
+def test_inverse_names_which_edge_it_pairs_with():
+    # `managed` declares itself the inverse of `manager`, so `staff` stays a relationship of its own.
+    found = inverses(
+        """
+classes:
+  Team:
+    attributes:
+      staff: { range: Person, multivalued: true }
+      managed: { range: Person, multivalued: true, inverse: manager }
+  Person:
+    attributes:
+      manager: { range: Team }
+      member_of: { range: Team, multivalued: true, inverse: staff }
+"""
+    )
+    assert found["Team.managed->Person"] == "Person.manager->Team"
+    assert found["Person.manager->Team"] is None
+    # `member_of` names `staff`: of two lists, the one declaring `inverse:` is the inverse.
+    assert found["Team.staff->Person"] is None
+    assert found["Person.member_of->Team"] == "Team.staff->Person"
+
+
+def test_self_references_are_never_inverses():
+    found = inverses(
+        "classes:\n  Node:\n    attributes:\n      children: { range: Node, multivalued: true }\n"
+        "      parent: { range: Node }\n"
+    )
+    assert set(found.values()) == {None}

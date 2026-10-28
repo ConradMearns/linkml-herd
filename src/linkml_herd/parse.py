@@ -54,6 +54,8 @@ class Slot:
     key: bool = False
     description: str | None = None
     inlined: bool = False
+    # Name of the slot this one is declared the `inverse` of.
+    inverse: str | None = None
     # Set when `range` resolves to another class in the schema (a foreign key).
     ref_class: str | None = None
     # True when `range` is not a known class, enum, type, or builtin.
@@ -82,6 +84,14 @@ class ForeignKey:
     to_slot: str | None
     multivalued: bool
     required: bool
+    # Slot name from the source slot's `inverse:`, if it declares one.
+    declared_inverse: str | None = None
+    # Id of the edge this one restates from the other end (see `_mark_inverses`).
+    inverse_of: str | None = None
+
+    @property
+    def inverse(self) -> bool:
+        return self.inverse_of is not None
 
     @property
     def id(self) -> str:
@@ -170,6 +180,7 @@ def parse_linkml(text: str, resolve_import: ImportResolver | None = None) -> Sch
             key=bool(merged.get("key")),
             description=merged.get("description"),
             inlined=bool(merged.get("inlined") or merged.get("inlined_as_list")),
+            inverse=str(merged["inverse"]) if merged.get("inverse") else None,
             ref_class=rng if is_class_ref else None,
             unresolved=not is_class_ref and rng not in scalar_ranges,
         )
@@ -234,8 +245,10 @@ def parse_linkml(text: str, resolve_import: ImportResolver | None = None) -> Sch
                         to_slot=by_name[s.ref_class].identifier_slot,
                         multivalued=s.multivalued,
                         required=s.required,
+                        declared_inverse=s.inverse,
                     )
                 )
+    _mark_inverses(foreign_keys)
 
     return Schema(
         name=doc.get("name") or "schema",
@@ -245,6 +258,40 @@ def parse_linkml(text: str, resolve_import: ImportResolver | None = None) -> Sch
         foreign_keys=foreign_keys,
         problems=problems,
     )
+
+
+def _mark_inverses(foreign_keys: list[ForeignKey]) -> None:
+    """Find edge pairs that draw one relationship twice, once from each end.
+
+    Two edges between the same classes in opposite directions pair up when one
+    names the other as its `inverse:`. Edges no `inverse:` speaks for also pair
+    implicitly when at least one is a list (`Customer.orders: Order[]` beside
+    `Order.customer`); two plain references (`Person.employer`, `Company.ceo`)
+    are separate relationships. Of a pair, the list end is the inverse; then
+    the end that declares `inverse:`; then the one declared later.
+    """
+
+    def opposing(e: ForeignKey, o: ForeignKey) -> bool:
+        return (o.from_class, o.to_class) == (e.to_class, e.from_class)
+
+    def names(e: ForeignKey, o: ForeignKey) -> bool:
+        return opposing(e, o) and e.declared_inverse == o.from_slot
+
+    spoken_for = {id(e) for e in foreign_keys if e.declared_inverse or any(names(o, e) for o in foreign_keys)}
+    for i, e in enumerate(foreign_keys):
+        if e.from_class == e.to_class:
+            continue
+        rank_e = (e.multivalued, e.declared_inverse is not None, i)
+        for j, o in enumerate(foreign_keys):
+            if not opposing(e, o):
+                continue
+            if id(e) in spoken_for or id(o) in spoken_for:
+                paired = names(e, o) or names(o, e)
+            else:
+                paired = e.multivalued or o.multivalued
+            if paired and rank_e > (o.multivalued, o.declared_inverse is not None, j):
+                e.inverse_of = o.id
+                break
 
 
 def file_resolver(base_dir: Path) -> ImportResolver:

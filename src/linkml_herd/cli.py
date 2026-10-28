@@ -14,7 +14,16 @@ from pathlib import Path
 import yaml
 
 from .parse import parse_linkml_file
-from .render import DEFAULT_THEME, THEMES, read_saved_layout, read_saved_theme, render_html, render_svg
+from .render import (
+    DEFAULT_THEME,
+    THEMES,
+    read_saved_inverse,
+    read_saved_layout,
+    read_saved_theme,
+    render_html,
+    render_svg,
+)
+from .update_check import ENV_OPT_OUT, UpdateCheck, current_version
 
 
 def output_path(schema_path: Path) -> Path:
@@ -49,8 +58,21 @@ def main(argv: list[str] | None = None) -> int:
         help="write an SVG image instead of the page (default: <schema>.svg; implied by -o *.svg), "
         "laid out and themed like <schema>.html if it exists",
     )
+    ap.add_argument(
+        "--inverse",
+        action=argparse.BooleanOptionalAction,
+        help="draw inverse relationships -- a list of children beside each child's reference back "
+        "(default: as the output page was saved, else off; the page has a toggle too)",
+    )
     ap.add_argument("--open", action="store_true", help="open the result in a browser")
+    ap.add_argument(
+        "--no-update-check",
+        action="store_true",
+        help=f"don't check PyPI for a newer linkml-herd (or set {ENV_OPT_OUT}=1)",
+    )
+    ap.add_argument("--version", action="version", version=f"%(prog)s {current_version() or 'unknown'}")
     args = ap.parse_args(argv)
+    update = None if args.no_update_check else UpdateCheck()
 
     try:
         schema = parse_linkml_file(args.schema)
@@ -77,9 +99,10 @@ def main(argv: list[str] | None = None) -> int:
     if saved.get("tables"):
         print(f"keeping canvas layout saved in {layout_from}", file=sys.stderr)
     theme = args.theme or (read_saved_theme(layout_from) if layout_from else None) or DEFAULT_THEME
+    show_inverse = args.inverse if args.inverse is not None else read_saved_inverse(layout_from)
 
     if svg:
-        text = render_svg(schema, saved_layout=saved, theme=theme)
+        text = render_svg(schema, saved_layout=saved, theme=theme, show_inverse=show_inverse)
     else:
         text = render_html(
             schema,
@@ -87,13 +110,15 @@ def main(argv: list[str] | None = None) -> int:
             source=args.schema.name,
             output_name=out.name if out else None,
             theme=theme,
+            show_inverse=show_inverse,
         )
     if out is None:
         sys.stdout.write(text)
-        return 0
-
-    out.write_text(text, encoding="utf-8")
-    print(f"wrote {out}", file=sys.stderr)
-    if args.open:
-        webbrowser.open(out.resolve().as_uri())
+    else:
+        out.write_text(text, encoding="utf-8")
+        print(f"wrote {out}", file=sys.stderr)
+        if args.open:
+            webbrowser.open(out.resolve().as_uri())
+    if update:
+        update.report()
     return 0

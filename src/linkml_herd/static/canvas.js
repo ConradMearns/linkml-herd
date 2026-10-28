@@ -286,6 +286,7 @@
     // The file keeps the theme linkml-herd baked in; switching in the menu is the viewer's own choice.
     if (bakedTheme === 'auto') doc.removeAttribute('data-theme');
     else doc.setAttribute('data-theme', bakedTheme);
+    q('inverse')?.toggleAttribute('checked', !!data.showInverse);
     q('actions').hidden = true;
     q('controls').hidden = true;
     q('save-state').className = 'save-state';
@@ -402,6 +403,7 @@
     img.setAttribute('height', h);
     const bg = img.querySelector('[data-bg]');
     for (const [k, v] of Object.entries({ x, y, width: w, height: h })) bg.setAttribute(k, v);
+    if (!data.showInverse) for (const g of img.querySelectorAll('g[data-inverse]')) g.remove();
     for (const g of img.querySelectorAll('g[data-name]')) {
       const t = tables.get(g.dataset.name);
       g.setAttribute('transform', `translate(${num(parseFloat(t.style.left))},${num(parseFloat(t.style.top))})`);
@@ -409,6 +411,7 @@
     const drawn = new Map([...img.querySelectorAll('g[data-id]')].map((g) => [g.dataset.id, g]));
     for (const edge of edges) {
       const g = drawn.get(edge.dataset.id);
+      if (!g) continue;
       g.querySelector('path').setAttribute('d', edge.querySelector('path').getAttribute('d'));
       for (const k of ['x', 'y']) g.querySelector('text').setAttribute(k, edge.querySelector('text').getAttribute(k));
     }
@@ -457,6 +460,14 @@
     }
   }
 
+  // --- inverse relationships ---------------------------------------------------------
+  // Off by default; "Save canvas" keeps the choice in the page, and linkml-herd reads it back.
+  function showInverse(on) {
+    data.showInverse = on;
+    document.documentElement.classList.toggle('show-inverse', on);
+    markDirty();
+  }
+
   // --- wire up ---------------------------------------------------------------------
   sizer.removeAttribute('style');
   viewport.classList.add('live');
@@ -467,6 +478,10 @@
   $('export').addEventListener('click', exportSvg);
   $('theme').value = document.documentElement.dataset.theme || 'auto';
   $('theme').addEventListener('change', (e) => setTheme(e.target.value));
+  if ($('inverse')) {
+    $('inverse').checked = !!data.showInverse; // browsers may restore a stale form state on reload
+    $('inverse').addEventListener('change', (e) => showInverse(e.target.checked));
+  }
   $('zoom-in').addEventListener('click', () => zoomCenter(1.2));
   $('zoom-out').addEventListener('click', () => zoomCenter(1 / 1.2));
   $('fit').addEventListener('click', fitView);
